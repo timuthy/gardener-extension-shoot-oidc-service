@@ -15,6 +15,8 @@ import (
 	extensionssecretsmanager "github.com/gardener/gardener/extensions/pkg/util/secret/manager"
 	v1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	extensionsv1alpha1helper "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1/helper"
+	operatorv1alpha1 "github.com/gardener/gardener/pkg/apis/operator/v1alpha1"
 	resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
 	gardenerkubernetes "github.com/gardener/gardener/pkg/client/kubernetes"
 	kubeapiserverconstants "github.com/gardener/gardener/pkg/component/kubernetes/apiserver/constants"
@@ -25,7 +27,9 @@ import (
 	"github.com/gardener/gardener/pkg/utils/kubernetes/health"
 	"github.com/gardener/gardener/pkg/utils/managedresources"
 	"github.com/gardener/gardener/pkg/utils/retry"
+	secretsutils "github.com/gardener/gardener/pkg/utils/secrets"
 	secretutils "github.com/gardener/gardener/pkg/utils/secrets"
+	secretsmanager "github.com/gardener/gardener/pkg/utils/secrets/manager"
 	"github.com/go-logr/logr"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	admissionregistration "k8s.io/api/admissionregistration/v1"
@@ -123,26 +127,60 @@ func getOIDCReplicas(ctx context.Context, c client.Client, namespace string, hib
 func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extensionsv1alpha1.Extension) error {
 	namespace := ex.GetNamespace()
 
-	cluster, err := controller.GetCluster(ctx, a.client, namespace)
-	if err != nil {
-		return err
-	}
-
 	oidcShootAccessSecret := gutil.NewShootAccessSecret(gutil.SecretNamePrefixShootAccess+constants.ApplicationName, namespace)
 	if err := oidcShootAccessSecret.Reconcile(ctx, a.client); err != nil {
 		return err
 	}
 
-	hibernated := controller.IsHibernationEnabled(cluster)
-	oidcReplicas, err := getOIDCReplicas(ctx, a.client, namespace, hibernated)
-	if err != nil {
-		return err
+	var (
+		hibernated                  bool
+		secretsManager              secretsmanager.Interface
+		genericTokenKubeconfigName  string
+		kubeAPIServerDeploymentName string
+
+		// initialize SecretsManager based on Cluster object
+		configs        = secrets.ConfigsFor(namespace)
+		extensionClass = extensionsv1alpha1helper.GetExtensionClassOrDefault(ex.Spec.Class)
+	)
+
+	if extensionClass == extensionsv1alpha1.ExtensionClassShoot {
+		cluster, err := controller.GetCluster(ctx, a.client, namespace)
+		if err != nil {
+			return err
+		}
+
+		hibernated = controller.IsHibernationEnabled(cluster)
+
+		secretsManager, err = extensionssecretsmanager.SecretsManagerForCluster(ctx, log.WithName("secretsmanager"), clock.RealClock{}, a.client, cluster, secrets.ManagerIdentity, configs)
+		if err != nil {
+			return err
+		}
+
+		kubeAPIServerDeploymentName = v1beta1constants.DeploymentNameKubeAPIServer
+		genericTokenKubeconfigName = extensions.GenericTokenKubeconfigSecretNameFromCluster(cluster)
+	} else if extensionClass == extensionsv1alpha1.ExtensionClassGarden {
+		garden, err := getGarden(ctx, a.client)
+		if err != nil {
+			return fmt.Errorf("failed to get garden: %w", err)
+		}
+
+		secretsManager, err = secretManagerFromGarden(ctx, log, a.client, clock.RealClock{}, namespace, garden, configs)
+		if err != nil {
+			return err
+		}
+
+		kubeAPIServerDeploymentName = "virtual-garden-" + v1beta1constants.DeploymentNameKubeAPIServer
+
+		var ok bool
+		genericTokenKubeconfigName, ok = garden.ObjectMeta.Annotations[v1beta1constants.AnnotationKeyGenericTokenKubeconfigSecretName]
+		if !ok {
+			return fmt.Errorf("no generic token kubeconfig secret found in garden object")
+		}
+	} else {
+		return fmt.Errorf("unsupported extension class %q", extensionClass)
 	}
 
-	// initialize SecretsManager based on Cluster object
-	configs := secrets.ConfigsFor(namespace)
-
-	secretsManager, err := extensionssecretsmanager.SecretsManagerForCluster(ctx, log.WithName("secretsmanager"), clock.RealClock{}, a.client, cluster, secrets.ManagerIdentity, configs)
+	oidcReplicas, err := getOIDCReplicas(ctx, a.client, namespace, hibernated)
 	if err != nil {
 		return err
 	}
@@ -160,9 +198,11 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 	seedResources, err := getSeedResources(
 		oidcReplicas,
 		namespace,
-		extensions.GenericTokenKubeconfigSecretNameFromCluster(cluster),
+		genericTokenKubeconfigName,
 		oidcShootAccessSecret.Secret.Name,
 		generatedSecrets[constants.WebhookTLSSecretName].Name,
+		kubeAPIServerDeploymentName,
+		extensionClass,
 	)
 	if err != nil {
 		return err
@@ -208,7 +248,7 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 	depl := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
-			Name:      v1beta1constants.DeploymentNameKubeAPIServer,
+			Name:      kubeAPIServerDeploymentName,
 		},
 	}
 
@@ -234,6 +274,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 func (a *actuator) delete(ctx context.Context, log logr.Logger, ex *extensionsv1alpha1.Extension, skipSecretsManagerSecrets bool) error {
 	namespace := ex.GetNamespace()
 	twoMinutes := 2 * time.Minute
+	extensionClass := extensionsv1alpha1helper.GetExtensionClassOrDefault(ex.Spec.Class)
 
 	timeoutSeedCtx, cancelSeedCtx := context.WithTimeout(ctx, twoMinutes)
 	defer cancelSeedCtx()
@@ -267,18 +308,33 @@ func (a *actuator) delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		}
 	}
 
-	cluster, err := controller.GetCluster(ctx, a.client, namespace)
-	if err != nil {
-		return err
-	}
-
 	if skipSecretsManagerSecrets {
 		return nil
 	}
 
-	secretsManager, err := extensionssecretsmanager.SecretsManagerForCluster(ctx, log.WithName("secretsmanager"), clock.RealClock{}, a.client, cluster, secrets.ManagerIdentity, nil)
-	if err != nil {
-		return err
+	var secretsManager secretsmanager.Interface
+	if extensionClass == extensionsv1alpha1.ExtensionClassShoot {
+		cluster, err := controller.GetCluster(ctx, a.client, namespace)
+		if err != nil {
+			return err
+		}
+
+		secretsManager, err = extensionssecretsmanager.SecretsManagerForCluster(ctx, log.WithName("secretsmanager"), clock.RealClock{}, a.client, cluster, secrets.ManagerIdentity, nil)
+		if err != nil {
+			return err
+		}
+	} else if extensionClass == extensionsv1alpha1.ExtensionClassGarden {
+		garden, err := getGarden(ctx, a.client)
+		if err != nil {
+			return fmt.Errorf("failed to get garden: %w", err)
+		}
+
+		secretsManager, err = secretManagerFromGarden(ctx, log, a.client, clock.RealClock{}, namespace, garden, nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("unsupported extension class %q", extensionClass)
 	}
 
 	return secretsManager.Cleanup(ctx)
@@ -327,14 +383,24 @@ func getHighAvailabilityLabel() map[string]string {
 	}
 }
 
-func getSeedResources(oidcReplicas *int32, namespace, genericKubeconfigName, shootAccessSecretName, serverTLSSecretName string) (map[string][]byte, error) {
+func getSeedResources(oidcReplicas *int32, namespace, genericKubeconfigName, shootAccessSecretName, serverTLSSecretName, kubeAPIServerDeploymentName string, extensionClass extensionsv1alpha1.ExtensionClass) (map[string][]byte, error) {
 	var (
+		priorityClassName        = v1beta1constants.PriorityClassNameShootControlPlane300
+		allScrapeTargetsFn       = gutil.InjectNetworkPolicyAnnotationsForScrapeTargets
+		serviceMonitorObjectMeta = monitoringutils.ConfigObjectMeta(constants.ApplicationName, namespace, "shoot")
+
 		int10443      = int32(10443)
 		port10443     = intstr.FromInt32(int10443)
 		registry      = managedresources.NewRegistry(gardenerkubernetes.SeedScheme, gardenerkubernetes.SeedCodec, gardenerkubernetes.SeedSerializer)
 		requestCPU    = resource.MustParse("10m")
 		requestMemory = resource.MustParse("32Mi")
 	)
+
+	if extensionClass == extensionsv1alpha1.ExtensionClassGarden {
+		priorityClassName = v1beta1constants.PriorityClassNameGardenSystem300
+		allScrapeTargetsFn = gutil.InjectNetworkPolicyAnnotationsForGardenScrapeTargets
+		serviceMonitorObjectMeta = monitoringutils.ConfigObjectMeta(constants.ApplicationName, namespace, "garden")
+	}
 
 	kubeConfig := &configv1.Config{
 		Clusters: []configv1.NamedCluster{{
@@ -389,11 +455,11 @@ func getSeedResources(oidcReplicas *int32, namespace, genericKubeconfigName, sho
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: utils.MergeStringMaps(getLabels(), map[string]string{
-						v1beta1constants.LabelNetworkPolicyToDNS:                                                            v1beta1constants.LabelNetworkPolicyAllowed,
-						v1beta1constants.LabelNetworkPolicyToPublicNetworks:                                                 v1beta1constants.LabelNetworkPolicyAllowed,
-						v1beta1constants.LabelNetworkPolicyToPrivateNetworks:                                                v1beta1constants.LabelNetworkPolicyAllowed,
-						gutil.NetworkPolicyLabel(v1beta1constants.DeploymentNameKubeAPIServer, kubeapiserverconstants.Port): v1beta1constants.LabelNetworkPolicyAllowed,
-						"networking.resources.gardener.cloud/to-all-istio-ingresses-istio-ingressgateway-tcp-9443":          v1beta1constants.LabelNetworkPolicyAllowed,
+						v1beta1constants.LabelNetworkPolicyToDNS:                                                   v1beta1constants.LabelNetworkPolicyAllowed,
+						v1beta1constants.LabelNetworkPolicyToPublicNetworks:                                        v1beta1constants.LabelNetworkPolicyAllowed,
+						v1beta1constants.LabelNetworkPolicyToPrivateNetworks:                                       v1beta1constants.LabelNetworkPolicyAllowed,
+						gutil.NetworkPolicyLabel(kubeAPIServerDeploymentName, kubeapiserverconstants.Port):         v1beta1constants.LabelNetworkPolicyAllowed,
+						"networking.resources.gardener.cloud/to-all-istio-ingresses-istio-ingressgateway-tcp-9443": v1beta1constants.LabelNetworkPolicyAllowed,
 					}),
 				},
 				Spec: corev1.PodSpec{
@@ -410,7 +476,7 @@ func getSeedResources(oidcReplicas *int32, namespace, genericKubeconfigName, sho
 					},
 					AutomountServiceAccountToken: ptr.To(false),
 					ServiceAccountName:           constants.ApplicationName,
-					PriorityClassName:            v1beta1constants.PriorityClassNameShootControlPlane300,
+					PriorityClassName:            priorityClassName,
 					Containers: []corev1.Container{{
 						Name:            constants.ApplicationName,
 						Image:           image.String(),
@@ -506,7 +572,7 @@ func getSeedResources(oidcReplicas *int32, namespace, genericKubeconfigName, sho
 		Port:     ptr.To(intstr.FromInt32(int10443)),
 		Protocol: ptr.To(corev1.ProtocolTCP),
 	}
-	if err := gutil.InjectNetworkPolicyAnnotationsForScrapeTargets(service, metricsPort); err != nil {
+	if err := allScrapeTargetsFn(service, metricsPort); err != nil {
 		return nil, err
 	}
 	if err := gutil.InjectNetworkPolicyAnnotationsForWebhookTargets(service, metricsPort); err != nil {
@@ -514,7 +580,7 @@ func getSeedResources(oidcReplicas *int32, namespace, genericKubeconfigName, sho
 	}
 
 	serviceMonitor := &monitoringv1.ServiceMonitor{
-		ObjectMeta: monitoringutils.ConfigObjectMeta(constants.ApplicationName, namespace, "shoot"),
+		ObjectMeta: serviceMonitorObjectMeta,
 		Spec: monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{MatchLabels: getLabels()},
 			Endpoints: []monitoringv1.Endpoint{{
@@ -669,4 +735,81 @@ func buildVPA(namespace string) *vpaautoscalingv1.VerticalPodAutoscaler {
 			},
 		},
 	}
+}
+
+func getGarden(ctx context.Context, client client.Client) (*operatorv1alpha1.Garden, error) {
+	gardenList := &operatorv1alpha1.GardenList{}
+	if err := client.List(ctx, gardenList); err != nil {
+		return nil, fmt.Errorf("failed to list gardens: %w", err)
+	}
+	if len(gardenList.Items) == 0 {
+		return nil, fmt.Errorf("no gardens found in cluster")
+	}
+	if len(gardenList.Items) > 1 {
+		return nil, fmt.Errorf("multiple gardens found, only one is supported")
+	}
+
+	return &gardenList.Items[0], nil
+}
+
+func secretManagerFromGarden(
+	ctx context.Context,
+	log logr.Logger,
+	client client.Client,
+	clock clock.Clock,
+	namespace string,
+	garden *operatorv1alpha1.Garden,
+	secretConfigs []extensionssecretsmanager.SecretConfigWithOptions,
+) (secretsmanager.Interface, error) {
+	return secretsmanager.New(
+		ctx,
+		log.WithName("secretsmanager"),
+		clock,
+		client,
+		namespace,
+		operatorv1alpha1.SecretManagerIdentityOperator,
+		secretsmanager.Config{
+			CASecretAutoRotation: true,
+			SecretNamesToTimes:   lastSecretRotationStartTimes(garden, secretConfigs),
+		},
+	)
+}
+
+func lastSecretRotationStartTimes(garden *operatorv1alpha1.Garden, secretConfigs []extensionssecretsmanager.SecretConfigWithOptions) map[string]time.Time {
+	var (
+		secretNamesToTime    = make(map[string]time.Time)
+		caLastInitiationTime *time.Time
+	)
+
+	if shootStatus := garden.Status; shootStatus.Credentials != nil && shootStatus.Credentials.Rotation != nil &&
+		shootStatus.Credentials.Rotation.CertificateAuthorities != nil &&
+		shootStatus.Credentials.Rotation.CertificateAuthorities.LastInitiationTime != nil {
+		timeCopy := shootStatus.Credentials.Rotation.CertificateAuthorities.LastInitiationTime.Time
+		caLastInitiationTime = &timeCopy
+	}
+
+	for _, caConfig := range filterCAConfigs(secretConfigs) {
+		// bind CA rotation lifecycle to the cluster CA (i.e. rotate in lockstep)
+		if caLastInitiationTime != nil {
+			secretNamesToTime[caConfig.Config.GetName()] = *caLastInitiationTime
+		}
+	}
+
+	return secretNamesToTime
+}
+
+// filterCAConfigs returns a list of all CA configs contained in the given list.
+func filterCAConfigs(secretConfigs []extensionssecretsmanager.SecretConfigWithOptions) []extensionssecretsmanager.SecretConfigWithOptions {
+	var caConfigs []extensionssecretsmanager.SecretConfigWithOptions
+
+	for _, config := range secretConfigs {
+		switch secretConfig := config.Config.(type) {
+		case *secretsutils.CertificateSecretConfig:
+			if secretConfig.CertType == secretsutils.CACert {
+				caConfigs = append(caConfigs, config)
+			}
+		}
+	}
+
+	return caConfigs
 }
