@@ -42,20 +42,21 @@ func New(mgr manager.Manager) (*extensionswebhook.Webhook, error) {
 		return nil, err
 	}
 
-	namespaceSelector := &metav1.LabelSelector{
-		MatchExpressions: []metav1.LabelSelectorRequirement{
-			{Key: v1beta1constants.LabelExtensionPrefix + "shoot-oidc-service", Operator: metav1.LabelSelectorOpIn, Values: []string{"true"}},
-		},
-	}
+	// TODO: Re-enable namespace selector once Gardner labels the garden namespace with the extensions enabled for the Garden resource.
+	// namespaceSelector := &metav1.LabelSelector{
+	// 	MatchExpressions: []metav1.LabelSelectorRequirement{
+	// 		 {Key: v1beta1constants.LabelExtensionPrefix + "shoot-oidc-service", Operator: metav1.LabelSelectorOpIn, Values: []string{"true"}}, // Disable for Garden case
+	// 	},
+	// }
 
 	webhook := &extensionswebhook.Webhook{
-		Name:              "oidc",
-		Provider:          "",
-		Types:             types,
-		Target:            extensionswebhook.TargetSeed,
-		Path:              "oidc",
-		Webhook:           &admission.Webhook{Handler: handler},
-		NamespaceSelector: namespaceSelector,
+		Name:     "oidc",
+		Provider: "",
+		Types:    types,
+		Target:   extensionswebhook.TargetSeed,
+		Path:     "oidc",
+		Webhook:  &admission.Webhook{Handler: handler},
+		// NamespaceSelector: namespaceSelector,
 		ObjectSelector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				v1beta1constants.GardenRole: v1beta1constants.GardenRoleControlPlane,

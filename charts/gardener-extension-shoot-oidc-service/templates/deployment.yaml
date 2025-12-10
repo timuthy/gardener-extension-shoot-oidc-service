@@ -6,14 +6,14 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gardener-extension-{{ .Values.serviceName }}
+  name: gardener-extension-{{ include "name" . }}
   namespace: {{ .Release.Namespace }}
 {{- if .Values.ignoreResources }}
   annotations:
     resources.gardener.cloud/ignore: "true"
 {{- end }}
   labels:
-    app.kubernetes.io/name: gardener-extension-{{ .Values.serviceName }}
+    app.kubernetes.io/name: gardener-extension-{{ include "name" . }}
     helm.sh/chart: gardener-extension-{{ .Values.serviceName }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     high-availability-config.resources.gardener.cloud/type: server
@@ -22,7 +22,7 @@ spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: gardener-extension-{{ .Values.serviceName }}
+      app.kubernetes.io/name: gardener-extension-{{ include "name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
@@ -38,7 +38,7 @@ spec:
         prometheus.io/port: "{{ .Values.metrics.port }}"
       {{- end }}
       labels:
-        app.kubernetes.io/name: gardener-extension-{{ .Values.serviceName }}
+        app.kubernetes.io/name: gardener-extension-{{ include "name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
         networking.gardener.cloud/to-runtime-apiserver: allowed
         networking.gardener.cloud/to-dns: allowed
@@ -88,6 +88,7 @@ spec:
         - --health-bind-address=:{{ .Values.healthPort }}
         {{- if .Values.gardener.runtimeCluster.enabled }}
         - --extension-class=garden
+        - --disable-controllers=healthcheck
         {{- else }}
         - --extension-class=shoot
         {{- end }}

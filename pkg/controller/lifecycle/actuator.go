@@ -767,7 +767,7 @@ func secretManagerFromGarden(
 		clock,
 		client,
 		namespace,
-		operatorv1alpha1.SecretManagerIdentityOperator,
+		secrets.ManagerIdentity,
 		secretsmanager.Config{
 			CASecretAutoRotation: true,
 			SecretNamesToTimes:   lastSecretRotationStartTimes(garden, secretConfigs),
@@ -781,10 +781,10 @@ func lastSecretRotationStartTimes(garden *operatorv1alpha1.Garden, secretConfigs
 		caLastInitiationTime *time.Time
 	)
 
-	if shootStatus := garden.Status; shootStatus.Credentials != nil && shootStatus.Credentials.Rotation != nil &&
-		shootStatus.Credentials.Rotation.CertificateAuthorities != nil &&
-		shootStatus.Credentials.Rotation.CertificateAuthorities.LastInitiationTime != nil {
-		timeCopy := shootStatus.Credentials.Rotation.CertificateAuthorities.LastInitiationTime.Time
+	if gardenStatus := garden.Status; gardenStatus.Credentials != nil && gardenStatus.Credentials.Rotation != nil &&
+		gardenStatus.Credentials.Rotation.CertificateAuthorities != nil &&
+		gardenStatus.Credentials.Rotation.CertificateAuthorities.LastInitiationTime != nil {
+		timeCopy := gardenStatus.Credentials.Rotation.CertificateAuthorities.LastInitiationTime.Time
 		caLastInitiationTime = &timeCopy
 	}
 

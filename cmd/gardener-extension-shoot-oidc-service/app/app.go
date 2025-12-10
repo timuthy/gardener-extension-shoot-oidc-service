@@ -11,6 +11,7 @@ import (
 	extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
 	"github.com/gardener/gardener/extensions/pkg/controller/heartbeat"
 	"github.com/gardener/gardener/extensions/pkg/util"
+	operatorv1alpha1 "github.com/gardener/gardener/pkg/apis/operator/v1alpha1"
 	gardenerhealthz "github.com/gardener/gardener/pkg/healthz"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/spf13/cobra"
@@ -82,6 +83,9 @@ func (o *Options) run(ctx context.Context) error {
 	}
 	if err := monitoringv1.AddToScheme(mgr.GetScheme()); err != nil {
 		return fmt.Errorf("could not update manager scheme: %w", err)
+	}
+	if err := operatorv1alpha1.AddToScheme(mgr.GetScheme()); err != nil {
+		return fmt.Errorf("could not update manager scheme: %s", err)
 	}
 
 	ctrlConfig := o.oidcOptions.Completed()

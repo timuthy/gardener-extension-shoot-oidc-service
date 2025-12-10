@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gardener/gardener/extensions/pkg/controller/extension"
+	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -55,5 +57,7 @@ func AddToManager(ctx context.Context, mgr manager.Manager) error {
 		Resync:            60 * time.Minute,
 		Predicates:        extension.DefaultPredicates(ctx, mgr, DefaultAddOptions.IgnoreOperationAnnotation),
 		Type:              constants.ExtensionType,
+		// TODO: Expose option to enable just one class to avoid collision when garden runtime is also seed cluster.
+		ExtensionClasses: []extensionsv1alpha1.ExtensionClass{"shoot", "garden"},
 	})
 }
