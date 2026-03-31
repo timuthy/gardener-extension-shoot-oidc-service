@@ -26,6 +26,8 @@ require (
 	sigs.k8s.io/controller-runtime v0.23.3
 )
 
+replace github.com/gardener/gardener => github.com/timuthy/gardener v0.0.0-20260331121002-5fd9d32a8bd8
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	dario.cat/mergo v1.0.2 // indirect

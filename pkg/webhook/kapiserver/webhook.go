@@ -14,8 +14,8 @@ import (
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	"github.com/gardener/gardener/pkg/component/extensions/operatingsystemconfig/original/components/kubelet"
 	oscutils "github.com/gardener/gardener/pkg/component/extensions/operatingsystemconfig/utils"
+	"github.com/gardener/gardener/pkg/controllerutils/predicate"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -44,29 +44,21 @@ func New(mgr manager.Manager) (*extensionswebhook.Webhook, error) {
 	logger := mgr.GetLogger().WithName("oidc-kapiserver-webhook")
 	logger.Info("Adding webhook to manager")
 
+	// The extension classes in AddOptions are the ones passed by the command line option.
+	// However, this webhook only supports a subset of classes which is why additional filtering is necessary.
+	extensionClasses := slices.DeleteFunc(slices.Clone(DefaultAddOptions.ExtensionClasses), func(class extensionsv1alpha1.ExtensionClass) bool {
+		return class == extensionsv1alpha1.ExtensionClassShoot || class == extensionsv1alpha1.ExtensionClassGarden
+	})
+
 	// We support only a single extension class at a time.
-	if len(DefaultAddOptions.ExtensionClasses) > 1 {
+	if len(extensionClasses) > 1 {
 		return nil, errors.New("only a single extension class is supported at a time")
 	}
 
-	var (
-		// The namespace selector is adjusted based on the configured extension class.
-		namespaceLabelSelectorRequirement metav1.LabelSelectorRequirement
-		secretsManagerIdentity            string
-	)
-	if len(DefaultAddOptions.ExtensionClasses) == 0 || slices.Contains(DefaultAddOptions.ExtensionClasses, extensionsv1alpha1.ExtensionClassShoot) {
-		namespaceLabelSelectorRequirement = metav1.LabelSelectorRequirement{
-			Key:      v1beta1constants.LabelExtensionPrefix + "shoot-oidc-service",
-			Operator: metav1.LabelSelectorOpIn,
-			Values:   []string{"true"},
-		}
+	var secretsManagerIdentity string
+	if len(extensionClasses) == 0 || slices.Contains(extensionClasses, extensionsv1alpha1.ExtensionClassShoot) {
 		secretsManagerIdentity = secrets.ManagerIdentity
-	} else if slices.Contains(DefaultAddOptions.ExtensionClasses, extensionsv1alpha1.ExtensionClassGarden) {
-		namespaceLabelSelectorRequirement = metav1.LabelSelectorRequirement{
-			Key:      corev1.LabelMetadataName,
-			Operator: metav1.LabelSelectorOpIn,
-			Values:   []string{v1beta1constants.GardenNamespace},
-		}
+	} else if slices.Contains(extensionClasses, extensionsv1alpha1.ExtensionClassGarden) {
 		secretsManagerIdentity = secrets.ManagerIdentityRuntime
 	}
 
@@ -84,25 +76,24 @@ func New(mgr manager.Manager) (*extensionswebhook.Webhook, error) {
 		{Obj: &appsv1.Deployment{}},
 	}
 
-	handler, err := extensionswebhook.NewBuilder(mgr, logger).WithMutator(mutator, types...).Build()
+	handler, err := extensionswebhook.
+		NewBuilder(mgr, logger).
+		WithMutator(mutator, types...).
+		WithPredicates(predicate.HasClass(extensionClasses...)).
+		Build()
 	if err != nil {
 		return nil, err
 	}
 
 	webhook := &extensionswebhook.Webhook{
-		Name:     Name,
-		Provider: "",
-		Types:    types,
-		Target:   extensionswebhook.TargetSeed,
-		Path:     "oidc",
+		Name:   Name,
+		Types:  types,
+		Target: extensionswebhook.TargetSeed,
+		Path:   "oidc",
 		Webhook: &admission.Webhook{
 			Handler: handler,
 		},
-		NamespaceSelector: &metav1.LabelSelector{
-			MatchExpressions: []metav1.LabelSelectorRequirement{
-				namespaceLabelSelectorRequirement,
-			},
-		},
+		NamespaceSelector: extensionswebhook.BuildExtensionTypeNamespaceSelector("shoot-oidc-service", extensionClasses),
 		ObjectSelector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				v1beta1constants.GardenRole: v1beta1constants.GardenRoleControlPlane,
